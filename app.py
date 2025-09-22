@@ -29,6 +29,7 @@ CUSTOM_ASPECT_OPTION = "カスタムサイズ"
 DEFAULT_ASPECT_LABEL = next(iter(ASPECT_RATIO_PRESETS))
 DEFAULT_CUSTOM_DIMENSION = 1024
 MAX_IMAGES = 4
+REFERENCE_IMAGE_LIMIT = 10
 
 
 @dataclass
@@ -40,6 +41,7 @@ class GenerationResult:
     mode: str
     width: int
     height: int
+    truncated_reference_count: int = 0
 
 
 def _ensure_multiple_of_eight(value: int) -> int:
@@ -108,7 +110,7 @@ def _extract_image_urls(result_payload: dict) -> List[str]:
 def call_seedream(
     api_key: str,
     prompt: str,
-    reference_image_path: Optional[str],
+    reference_image_paths: Optional[Sequence[str]],
     aspect_label: str,
     width: float,
     height: float,
@@ -125,6 +127,13 @@ def call_seedream(
 
     resolved_width, resolved_height = _prepare_dimensions(aspect_label, width, height)
     image_count = max(1, min(int(num_images), MAX_IMAGES))
+    reference_paths: List[str] = [
+        path for path in (reference_image_paths or []) if isinstance(path, str) and path
+    ]
+    truncated_reference_count = 0
+    if len(reference_paths) > REFERENCE_IMAGE_LIMIT:
+        truncated_reference_count = len(reference_paths) - REFERENCE_IMAGE_LIMIT
+        reference_paths = reference_paths[:REFERENCE_IMAGE_LIMIT]
 
     if progress is None:
         progress = gr.Progress()
@@ -146,16 +155,26 @@ def call_seedream(
     endpoint = "fal-ai/bytedance/seedream/v4/text-to-image"
     mode = "text-to-image"
 
-    if reference_image_path:
+    if reference_paths:
         progress(0.2, desc="参照画像をアップロード中…")
-        upload_url = client.upload_file(reference_image_path)
+        uploaded_urls: List[str] = []
+        for idx, reference_path in enumerate(reference_paths):
+            progress(
+                0.2 + 0.1 * ((idx + 1) / max(len(reference_paths), 1)),
+                desc=f"参照画像 {idx + 1} / {len(reference_paths)} をアップロード中…",
+            )
+            upload_url = client.upload_file(reference_path)
+            uploaded_urls.append(upload_url)
+
         request_arguments.update(
             {
-                "image_url": upload_url,
+                "image_urls": uploaded_urls,
                 # Strength balances between preserving the input and applying the prompt.
                 "strength": 0.7,
             }
         )
+        if len(uploaded_urls) == 1:
+            request_arguments["image_url"] = uploaded_urls[0]
         endpoint = "fal-ai/bytedance/seedream/v4/edit"
         mode = "image-to-image"
 
@@ -185,13 +204,14 @@ def call_seedream(
         mode=mode,
         width=resolved_width,
         height=resolved_height,
+        truncated_reference_count=truncated_reference_count,
     )
 
 
 def on_generate(
     api_key: str,
     prompt: str,
-    reference_image_path: Optional[str],
+    reference_image_paths: Optional[Sequence[str]],
     aspect_label: str,
     width: float,
     height: float,
@@ -203,7 +223,7 @@ def on_generate(
         result = call_seedream(
             api_key=api_key,
             prompt=prompt,
-            reference_image_path=reference_image_path,
+            reference_image_paths=reference_image_paths,
             aspect_label=aspect_label,
             width=width,
             height=height,
@@ -227,6 +247,11 @@ def on_generate(
         f" {len(result.gallery_entries)} 枚生成しました。\n"
         f"解像度: {result.width} × {result.height}px"
     )
+    if result.truncated_reference_count:
+        status_message += (
+            f"\n⚠️ 参照画像が {REFERENCE_IMAGE_LIMIT} 枚を超えていたため、"
+            f"最初の {REFERENCE_IMAGE_LIMIT} 枚のみを使用しました。"
+        )
 
     return (
         result.gallery_entries,
@@ -263,6 +288,25 @@ def on_gallery_select(evt: gr.SelectData, download_paths: List[str]):
     selected_path = download_paths[index]
     file_name = os.path.basename(selected_path)
     return index, gr.update(value=selected_path, visible=True, label=f"選択中: {file_name}")
+
+
+def prepare_reference_previews(reference_files: Optional[Sequence[str]]):
+    if not reference_files:
+        return []
+
+    previews: List[Tuple[Image.Image, str]] = []
+    for path in list(reference_files)[:REFERENCE_IMAGE_LIMIT]:
+        if not path:
+            continue
+        try:
+            with Image.open(path) as img:
+                preview = img.convert("RGB")
+                preview.thumbnail((512, 512), Image.LANCZOS)
+        except Exception:
+            continue
+        previews.append((preview, os.path.basename(path)))
+
+    return previews
 
 
 def set_api_key(new_key: str):
@@ -322,10 +366,22 @@ def build_demo() -> gr.Blocks:
 
                 with gr.Accordion("参照画像 (任意)", open=True):
                     gr.Markdown(
-                        "参照画像をドロップすると自動的に Seedream 4.0 の image-to-image モードで処理されます。"
+                        "参照画像をドロップすると自動的に Seedream 4.0 の image-to-image モードで処理されます。\n"
+                        "最大10枚まで追加でき、ここでは縮小プレビューで確認できます。"
                     )
-                    reference_image_input = gr.Image(
-                        label="参照画像", type="filepath", image_mode="RGB", height=256
+                    reference_image_input = gr.Files(
+                        label="参照画像",
+                        type="filepath",
+                        file_types=["image"],
+                        file_count="multiple",
+                    )
+                    reference_preview = gr.Gallery(
+                        label="参照画像プレビュー",
+                        columns=5,
+                        height=256,
+                        allow_preview=True,
+                        object_fit="contain",
+                        show_label=True,
                     )
 
                 with gr.Accordion("生成パラメータ", open=False):
@@ -397,6 +453,12 @@ def build_demo() -> gr.Blocks:
             update_dimensions,
             inputs=[aspect_dropdown, width_input, height_input],
             outputs=[width_input, height_input],
+        )
+
+        reference_image_input.change(
+            prepare_reference_previews,
+            inputs=[reference_image_input],
+            outputs=[reference_preview],
         )
 
         generate_button.click(
